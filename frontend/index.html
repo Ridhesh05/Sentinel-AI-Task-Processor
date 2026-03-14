@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Sentinel AI Task Processor</title>
+  <style>
+    body {
+      font-family: Arial;
+      padding: 20px;
+      max-width: 1200px;
+      margin: auto;
+      background: #fafafa;
+      color: #111;
+    }
+
+    h1 { margin-bottom: 5px; }
+    .subtitle { color: #666; margin-top: 0; }
+
+    input, select, button, textarea {
+      padding: 10px;
+      margin: 6px 0;
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+      box-sizing: border-box;
+    }
+
+    button { cursor: pointer; font-weight: bold; }
+    button.primary { background: #111; color: white; border: none; }
+    button.secondary { background: #fff; color: #111; border: 1px solid #111; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* 3 columns: Create | History | Live Events */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .box {
+      background: white;
+      border: 1px solid #e5e5e5;
+      padding: 14px;
+      border-radius: 14px;
+      margin-top: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .kv { margin: 6px 0; color: #333; }
+    .muted { color: #777; font-size: 13px; }
+    .small { font-size: 12px; }
+
+    .badge {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: bold;
+      border: 1px solid #ddd;
+    }
+
+    .badge.QUEUED { background: #fff7e6; border-color: #ffd9a8; color: #8a4b00; }
+    .badge.PROCESSING { background: #e8f1ff; border-color: #b5d3ff; color: #0047a3; }
+    .badge.COMPLETED { background: #eafff0; border-color: #b7f5c8; color: #0a6b2d; }
+    .badge.FAILED { background: #ffeaea; border-color: #ffc1c1; color: #b10000; }
+
+    pre {
+      background: #0b1020;
+      color: #e5e7eb;
+      padding: 12px;
+      border-radius: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      min-height: 120px;
+    }
+
+    .log {
+      background: #0b1020;
+      color: #16ff72;
+      padding: 12px;
+      border-radius: 12px;
+      height: 250px;
+      overflow: auto;
+      font-size: 13px;
+    }
+
+    code {
+      background: #f3f3f3;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    /* history cards */
+    .history-card {
+      border: 1px solid #eee;
+      border-radius: 12px;
+      padding: 10px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: 0.1s;
+    }
+    .history-card:hover {
+      border-color: #ccc;
+      transform: translateY(-1px);
+    }
+    /* ✅ Responsive layout */
+@media (max-width: 1100px) {
+  .grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 750px) {
+  body {
+    padding: 12px;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  textarea {
+    font-size: 14px;
+  }
+
+  .row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  button {
+    width: 100%;
+  }
+
+  .log {
+    height: 180px;
+    font-size: 12px;
+  }
+
+  pre {
+    font-size: 12px;
+  }
+}
+
+  </style>
+</head>
+
+<body>
+  <h1>Sentinel AI Task Processor</h1>
+  <p class="subtitle">
+    Distributed background AI tasks using Redis Streams + PostgreSQL + Gemini + Real-time monitoring
+  </p>
+
+  <div class="grid">
+    <!-- CREATE TASK -->
+    <div class="box">
+      <h3>Create Task</h3>
+
+      <label>Task Type</label>
+      <select id="taskType">
+        <option value="summarize">summarize</option>
+        <option value="classify">classify</option>
+        <option value="tag">tag</option>
+      </select>
+
+      <label>Input Text</label>
+      <textarea id="inputText" rows="6">Redis Streams helps with consumer groups and crash recovery...</textarea>
+
+      <button class="primary" id="submitBtn" onclick="createTask()">Submit Task</button>
+
+      <div style="margin-top:10px;">
+        <div class="kv"><b>Task ID:</b> <span id="taskId">-</span></div>
+
+        <div class="kv row">
+          <div>
+            <b>Status:</b>
+            <span id="statusBadge" class="badge">-</span>
+          </div>
+          <div class="muted small" id="duration">Duration: -</div>
+        </div>
+
+        <div class="kv muted">Queued At: <span id="queuedAt">-</span></div>
+        <div class="kv muted">Started At: <span id="startedAt">-</span></div>
+        <div class="kv muted">Completed At: <span id="completedAt">-</span></div>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button class="secondary" id="refreshBtn" onclick="fetchResult()" disabled>Refresh</button>
+        <button class="secondary" id="retryBtn" onclick="retryTask()" disabled>Retry</button>
+      </div>
+
+      <p class="muted small">
+        API: <code>http://localhost:8000</code> |
+        WS: <code>ws://localhost:9000/ws</code>
+      </p>
+    </div>
+
+    <!-- TASK HISTORY -->
+    <div class="row">
+  <h3 style="margin:0;">Task History</h3>
+
+  <div style="display:flex; gap:8px; width:100%; justify-content:flex-end;">
+    <select id="statusFilter" onchange="applyHistoryFilter()" style="max-width:180px;">
+      <option value="ALL" selected>All</option>
+      <option value="QUEUED">QUEUED</option>
+      <option value="PROCESSING">PROCESSING</option>
+      <option value="COMPLETED">COMPLETED</option>
+      <option value="FAILED">FAILED</option>
+    </select>
+
+    <button class="secondary" onclick="loadHistory()" style="width: fit-content; padding: 8px 12px;">
+      Refresh
+    </button>
+  </div>
+</div>
+
+
+      <div id="historyList" style="margin-top:10px;">
+        <p class="muted">No tasks yet.</p>
+      </div>
+    </div>
+
+    <!-- LIVE EVENTS -->
+    <div class="box">
+      <h3>Live Events (Real-Time)</h3>
+      <div class="log" id="eventLog"></div>
+    </div>
+  </div>
+
+  <!-- RESULT -->
+  <div class="box">
+    <h3>Result</h3>
+    <pre id="resultBox">-</pre>
+  </div>
+
+<script>
+  const API_BASE = "http://localhost:8000";
+  const WS_URL = "ws://localhost:9000/ws";
+
+  let currentTaskId = null;
+  let pollInterval = null;
+  let allTasks = [];
+
+
+  function logEvent(text) {
+    const log = document.getElementById("eventLog");
+    log.innerText += text + "\n";
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setBadge(status) {
+    const badge = document.getElementById("statusBadge");
+    badge.className = "badge"; // reset
+    if (!status) {
+      badge.innerText = "-";
+      return;
+    }
+    badge.innerText = status;
+    badge.classList.add(status);
+  }
+
+  function setTimelineDefaults() {
+    document.getElementById("queuedAt").innerText = "-";
+    document.getElementById("startedAt").innerText = "-";
+    document.getElementById("completedAt").innerText = "-";
+    document.getElementById("duration").innerText = "Duration: -";
+  }
+
+  function stopPolling() {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    pollInterval = setInterval(async () => {
+      await fetchResult();
+    }, 2000);
+  }
+
+  // WebSocket for real-time monitor logs
+  const ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => logEvent("[WS] Connected to monitor");
+  ws.onclose = () => logEvent("[WS] Disconnected");
+  ws.onerror = () => logEvent("[WS] Error");
+
+  ws.onmessage = async (event) => {
+    logEvent(event.data);
+    try {
+      const payload = JSON.parse(event.data);
+      if (currentTaskId && payload.task_id === currentTaskId) {
+        await fetchResult();
+      }
+    } catch (e) {}
+  };
+
+  async function createTask() {
+    const submitBtn = document.getElementById("submitBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const retryBtn = document.getElementById("retryBtn");
+
+    submitBtn.disabled = true;
+    retryBtn.disabled = true;
+
+    document.getElementById("resultBox").innerText = "-";
+    document.getElementById("taskId").innerText = "-";
+    setBadge(null);
+    setTimelineDefaults();
+
+    const taskType = document.getElementById("taskType").value;
+    const inputText = document.getElementById("inputText").value;
+
+    try {
+      const res = await fetch(`${API_BASE}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_type: taskType, input_text: inputText })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        logEvent(`[API ERROR] ${data.detail || JSON.stringify(data)}`);
+        submitBtn.disabled = false;
+        return;
+      }
+
+      currentTaskId = data.task_id || data.id;
+      document.getElementById("taskId").innerText = currentTaskId;
+
+      logEvent(`[UI] Created task ${currentTaskId}`);
+
+      refreshBtn.disabled = false;
+
+      // refresh history now that a new task is created
+      await loadHistory();
+
+      // fetch + poll status
+      await fetchResult();
+      startPolling();
+
+    } catch (err) {
+      logEvent(`[UI ERROR] ${err}`);
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  async function fetchResult() {
+    const refreshBtn = document.getElementById("refreshBtn");
+    const retryBtn = document.getElementById("retryBtn");
+
+    if (!currentTaskId) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${currentTaskId}`);
+      const data = await res.json();
+
+      setBadge(data.status);
+      refreshBtn.disabled = false;
+
+      document.getElementById("queuedAt").innerText = data.queued_at || "-";
+      document.getElementById("startedAt").innerText = data.started_at || "-";
+      document.getElementById("completedAt").innerText = data.completed_at || "-";
+
+      if (data.started_at && data.completed_at) {
+        const start = new Date(data.started_at);
+        const end = new Date(data.completed_at);
+        const seconds = Math.round((end - start) / 1000);
+        document.getElementById("duration").innerText = `Duration: ${seconds}s`;
+      } else {
+        document.getElementById("duration").innerText = "Duration: -";
+      }
+
+      document.getElementById("resultBox").innerText =
+        data.output_text || data.result || data.error || JSON.stringify(data, null, 2);
+
+      // Retry enabled only when FAILED
+      retryBtn.disabled = (data.status !== "FAILED");
+
+      // Stop polling when finished
+      if (data.status === "COMPLETED" || data.status === "FAILED") {
+        stopPolling();
+      }
+
+    } catch (err) {
+      logEvent(`[FETCH ERROR] ${err}`);
+    }
+  }
+
+  async function retryTask() {
+    const retryBtn = document.getElementById("retryBtn");
+    if (!currentTaskId) return;
+
+    retryBtn.disabled = true;
+    logEvent(`[UI] Retrying task ${currentTaskId}...`);
+
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${currentTaskId}/retry`, {
+        method: "POST"
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        logEvent(`[RETRY ERROR] ${data.detail || JSON.stringify(data)}`);
+        return;
+      }
+
+      logEvent(`[UI] Retry accepted: ${JSON.stringify(data)}`);
+
+      await loadHistory();
+      await fetchResult();
+      startPolling();
+
+    } catch (err) {
+      logEvent(`[RETRY ERROR] ${err}`);
+    }
+  }
+
+ async function loadHistory() {
+  const historyDiv = document.getElementById("historyList");
+  historyDiv.innerHTML = `<p class="muted">Loading...</p>`;
+
+  try {
+    const res = await fetch(`${API_BASE}/tasks?limit=20`);
+    const data = await res.json();
+
+    allTasks = data.tasks || [];
+
+    if (allTasks.length === 0) {
+      historyDiv.innerHTML = `<p class="muted">No tasks yet.</p>`;
+      return;
+    }
+
+    applyHistoryFilter();
+
+  } catch (err) {
+    historyDiv.innerHTML = `<p class="muted">Failed to load history</p>`;
+  }
+}
+
+  async function selectTask(taskId) {
+    currentTaskId = taskId;
+    document.getElementById("taskId").innerText = taskId;
+    logEvent(`[UI] Selected task ${taskId}`);
+    await fetchResult();
+  }
+
+  function applyHistoryFilter() {
+  const historyDiv = document.getElementById("historyList");
+  const selected = document.getElementById("statusFilter").value;
+
+  let filtered = allTasks;
+
+  if (selected !== "ALL") {
+    filtered = allTasks.filter(t => t.status === selected);
+  }
+
+  if (filtered.length === 0) {
+    historyDiv.innerHTML = `<p class="muted">No tasks for this filter.</p>`;
+    return;
+  }
+
+  historyDiv.innerHTML = filtered.map(t => {
+    return `
+      <div class="history-card" onclick="selectTask('${t.id}')">
+        <div class="row">
+          <b>${t.task_type}</b>
+          <span class="badge ${t.status}">${t.status}</span>
+        </div>
+        <div class="muted small">${t.id}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+  
+  window.onload = async () => {
+    await loadHistory();
+  };
+
+
+</script>
+
+</body>
+</html>

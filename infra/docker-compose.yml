@@ -1,0 +1,19 @@
+# image of postgres database 
+# image of redis 
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: sentinel_postgres
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel_db
+    ports:
+      - "5432:5432"
+  redis:
+    image: redis:7
+    container_name: sentinel_redis
+    ports:
+      - "6379:6379"

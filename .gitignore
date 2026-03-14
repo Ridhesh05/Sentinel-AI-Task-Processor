@@ -1,0 +1,37 @@
+# Environment and secrets (use .env.example only; never commit real keys)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local / test
+*.sqlite3
+*.db
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
