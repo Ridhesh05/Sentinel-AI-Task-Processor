@@ -1,38 +1,92 @@
-import time
-import redis
-import psycopg2
+"""
+Sentinel Worker — Redis Streams consumer that processes AI tasks with Gemini.
+
+Changes from original:
+  - All print() replaced with structured logging
+  - Main loop guarded by if __name__ == "__main__"
+  - Prometheus metrics exposed via HTTP server on port 9100
+  - Broad except Exception narrowed where safe
+  - XTRIM "MAXAGE" replaced with MAXLEN (MAXAGE is not a standard Redis 7 command arg)
+"""
+
+import json
+import logging
 import os
 import sys
+import time
+import threading
 from datetime import datetime
-from google import genai
-import json
 
-# Allow running as python worker/worker.py from repo root
+import psycopg2
+import redis
+from google import genai
+from prometheus_client import Counter, Histogram, start_http_server
+
+# ---------------------------------------------------------------------------
+# Path fix — allow running as `python worker/worker.py` from repo root
+# ---------------------------------------------------------------------------
 _worker_dir = os.path.dirname(os.path.abspath(__file__))
 if _worker_dir not in sys.path:
     sys.path.insert(0, _worker_dir)
-from snowflake import generate_snowflake_id
 
-STREAM_NAME = "ai_task_queue"
-GROUP_NAME = "ai_workers"
-CONSUMER_NAME = "worker-1"
+from snowflake import generate_snowflake_id  # noqa: E402
 
-# Flush/trim stream: remove entries older than this (minutes). 0 = disabled.
-STREAM_TRIM_MAXAGE_MINUTES = int(os.getenv("STREAM_TRIM_MAXAGE_MINUTES", "15"))
-# Delay before processing each task (seconds), to avoid hammering DB under high traffic. 0 = no delay.
-PROCESSING_DELAY_SEC = int(os.getenv("PROCESSING_DELAY_SEC", "120"))
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-# Retry config for processing (Gemini/DB transient failures)
-PROCESS_MAX_RETRIES = int(os.getenv("PROCESS_MAX_RETRIES", "3"))
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+STREAM_NAME  = "ai_task_queue"
+GROUP_NAME   = "ai_workers"
+CONSUMER_NAME = os.getenv("WORKER_NAME", "worker-1")
+
+STREAM_TRIM_MAXLEN          = int(os.getenv("STREAM_TRIM_MAXLEN", "10000"))
+PROCESSING_DELAY_SEC        = int(os.getenv("PROCESSING_DELAY_SEC", "0"))
+PROCESS_MAX_RETRIES         = int(os.getenv("PROCESS_MAX_RETRIES", "3"))
 PROCESS_RETRY_BASE_DELAY_SEC = float(os.getenv("PROCESS_RETRY_BASE_DELAY_SEC", "1.0"))
+METRICS_PORT                = int(os.getenv("METRICS_PORT", "9100"))
 
-# Redis connection (with timeouts)
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "10"))
-REDIS_CONNECT_RETRIES = int(os.getenv("REDIS_CONNECT_RETRIES", "5"))
+REDIS_HOST               = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT               = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_SOCKET_TIMEOUT     = int(os.getenv("REDIS_SOCKET_TIMEOUT", "10"))
+REDIS_CONNECT_RETRIES    = int(os.getenv("REDIS_CONNECT_RETRIES", "5"))
 REDIS_CONNECT_RETRY_DELAY = float(os.getenv("REDIS_CONNECT_RETRY_DELAY", "2.0"))
+PUBSUB_CHANNEL           = "task_events"
 
+DB_HOST                = os.getenv("DB_HOST", "localhost")
+DB_PORT                = int(os.getenv("DB_PORT", "5432"))
+DB_NAME                = os.getenv("DB_NAME", "sentinel_db")
+DB_USER                = os.getenv("DB_USER", "sentinel")
+DB_PASSWORD            = os.getenv("DB_PASSWORD", "sentinel")
+DB_CONNECT_RETRIES     = int(os.getenv("DB_CONNECT_RETRIES", "5"))
+DB_CONNECT_RETRY_DELAY = float(os.getenv("DB_CONNECT_RETRY_DELAY", "1.0"))
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+TASKS_PROCESSED = Counter(
+    "worker_tasks_processed_total", "Tasks successfully completed", ["worker"]
+)
+TASKS_FAILED = Counter(
+    "worker_tasks_failed_total", "Tasks that exhausted all retries", ["worker"]
+)
+TASK_DURATION = Histogram(
+    "worker_task_processing_seconds",
+    "Time spent processing a single task (Gemini + DB write)",
+    ["worker"],
+)
+
+# ---------------------------------------------------------------------------
+# Redis client (sync, for stream consumer)
+# ---------------------------------------------------------------------------
 redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
@@ -41,11 +95,23 @@ redis_client = redis.Redis(
     socket_connect_timeout=REDIS_SOCKET_TIMEOUT,
 )
 
-PUBSUB_CHANNEL = "task_events"
+
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
+def _build_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+    return genai.Client(api_key=api_key)
 
 
-def publish_event(event_type, task_id, extra=None):
-    """Publish event with Snowflake event_id. Swallows Redis errors so worker keeps running."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def publish_event(event_type: str, task_id: str, extra: dict | None = None) -> None:
+    """Publish a JSON event to the Redis Pub/Sub channel. Never raises."""
     payload = {
         "event_id": str(generate_snowflake_id()),
         "event": event_type,
@@ -57,25 +123,7 @@ def publish_event(event_type, task_id, extra=None):
     try:
         redis_client.publish(PUBSUB_CHANNEL, json.dumps(payload))
     except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
-        print(f"Warning: failed to publish event ({event_type}): {e}")
-
-# Gemini setup
-
-# Gemini setup (NEW SDK)
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-
-client = genai.Client(api_key=api_key)
-MODEL_NAME = "gemini-2.5-flash"
-
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "sentinel_db")
-DB_USER = os.getenv("DB_USER", "sentinel")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "sentinel")
-DB_CONNECT_RETRIES = int(os.getenv("DB_CONNECT_RETRIES", "5"))
-DB_CONNECT_RETRY_DELAY = float(os.getenv("DB_CONNECT_RETRY_DELAY", "1.0"))
+        logger.warning("Failed to publish event event_type=%s error=%s", event_type, e)
 
 
 def get_db_connection():
@@ -93,50 +141,60 @@ def get_db_connection():
             )
         except psycopg2.OperationalError as e:
             last_err = e
-            print(f"DB connect attempt {attempt + 1}/{DB_CONNECT_RETRIES} failed: {e}")
+            logger.warning(
+                "DB connect attempt %d/%d failed: %s", attempt + 1, DB_CONNECT_RETRIES, e
+            )
             if attempt < DB_CONNECT_RETRIES - 1:
                 time.sleep(DB_CONNECT_RETRY_DELAY)
     raise last_err
 
 
-def ensure_consumer_group():
+def ensure_consumer_group() -> None:
     try:
         redis_client.xgroup_create(STREAM_NAME, GROUP_NAME, id="0", mkstream=True)
+        logger.info("Consumer group created stream=%s group=%s", STREAM_NAME, GROUP_NAME)
     except redis.exceptions.ResponseError:
-        pass  # group exists
+        logger.debug("Consumer group already exists stream=%s group=%s", STREAM_NAME, GROUP_NAME)
 
-def reclaim_stuck_tasks():
+
+def reclaim_stuck_tasks() -> list:
+    """Reclaim messages idle > 10 s from other consumers."""
     try:
         pending = redis_client.xpending_range(STREAM_NAME, GROUP_NAME, min="-", max="+", count=10)
-    except (redis.ConnectionError, redis.TimeoutError):
+    except (redis.ConnectionError, redis.TimeoutError) as e:
+        logger.warning("Could not check pending messages: %s", e)
         return []
+
     reclaimed = []
     for entry in pending:
         message_id = entry["message_id"]
         idle_time = entry["time_since_delivered"]
-        if idle_time > 10000:
+        if idle_time > 10_000:
             try:
                 messages = redis_client.xclaim(
                     STREAM_NAME, GROUP_NAME, CONSUMER_NAME,
-                    min_idle_time=10000, message_ids=[message_id],
+                    min_idle_time=10_000, message_ids=[message_id],
                 )
                 reclaimed.extend(messages)
-            except (redis.ConnectionError, redis.TimeoutError):
+                logger.info("Reclaimed stuck message message_id=%s idle_ms=%d", message_id, idle_time)
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                logger.warning("XCLAIM failed for message_id=%s: %s", message_id, e)
                 break
     return reclaimed
-def trim_stream_if_due():
-    """Trim stream to remove entries older than STREAM_TRIM_MAXAGE_MINUTES (run periodically)."""
-    if STREAM_TRIM_MAXAGE_MINUTES <= 0:
+
+
+def trim_stream_if_due() -> None:
+    """Trim stream to STREAM_TRIM_MAXLEN entries (approximate, ~)."""
+    if STREAM_TRIM_MAXLEN <= 0:
         return
     try:
-        maxage_ms = STREAM_TRIM_MAXAGE_MINUTES * 60 * 1000
-        redis_client.execute_command("XTRIM", STREAM_NAME, "MAXAGE", maxage_ms)
+        redis_client.xtrim(STREAM_NAME, maxlen=STREAM_TRIM_MAXLEN, approximate=True)
     except Exception as e:
-        print(f"Stream trim failed: {e}")
+        logger.warning("Stream trim failed: %s", e)
 
 
-def _parse_task_id(task_id_raw):
-    """Parse task_id from stream to int for DB (Snowflake BIGINT). Returns (int_id, str_id) or (None, None)."""
+def _parse_task_id(task_id_raw) -> tuple[int | None, str | None]:
+    """Parse task_id from stream. Returns (int_id, str_id) or (None, None) on error."""
     try:
         s = str(task_id_raw).strip()
         n = int(s)
@@ -147,40 +205,56 @@ def _parse_task_id(task_id_raw):
         return None, None
 
 
-def process_task(message_id, data):
-    task_id_str = data.get("task_id")
-    task_id_int, task_id_str = _parse_task_id(task_id_str)
+def _ack(message_id: str) -> None:
+    """ACK a stream message, swallowing Redis errors."""
+    try:
+        redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
+    except (redis.ConnectionError, redis.TimeoutError) as e:
+        logger.warning("Failed to ACK message_id=%s: %s", message_id, e)
+
+
+# ---------------------------------------------------------------------------
+# Core task processor
+# ---------------------------------------------------------------------------
+
+def process_task(message_id: str, data: dict, gemini_client) -> None:
+    task_id_int, task_id_str = _parse_task_id(data.get("task_id"))
+
     if task_id_int is None:
-        print(f"Invalid stream payload: bad task_id {task_id_str!r}")
-        try:
-            redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-        except (redis.ConnectionError, redis.TimeoutError):
-            pass
+        logger.error("Invalid stream payload — bad task_id: %r", data.get("task_id"))
+        _ack(message_id)
         return
 
-    task_type = data.get("task_type")
+    task_type  = data.get("task_type")
     input_text = data.get("input_text")
+
     if not task_type or not input_text:
-        print(f"Invalid stream payload for {task_id_str}: missing task_type or input_text")
-        try:
-            redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-        except (redis.ConnectionError, redis.TimeoutError):
-            pass
+        logger.error(
+            "Invalid stream payload task_id=%s: missing task_type or input_text", task_id_str
+        )
+        _ack(message_id)
         return
 
     if PROCESSING_DELAY_SEC > 0:
-        print(f"Task {task_id_str}: waiting {PROCESSING_DELAY_SEC}s before processing...")
+        logger.info("Task %s: artificial delay %ds", task_id_str, PROCESSING_DELAY_SEC)
         time.sleep(PROCESSING_DELAY_SEC)
-    print(f"Processing task {task_id_str}")
+
+    logger.info("Processing task task_id=%s type=%s", task_id_str, task_type)
 
     last_error = None
+    conn = None
+    cur = None
+
     for attempt in range(PROCESS_MAX_RETRIES):
         try:
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # 1) Fetch or materialize task row (id is BIGINT / Snowflake)
-            cur.execute("SELECT status, task_type, input_text FROM tasks WHERE id=%s", (task_id_int,))
+            # Fetch or materialise task row
+            cur.execute(
+                "SELECT status, task_type, input_text FROM tasks WHERE id=%s",
+                (task_id_int,),
+            )
             row = cur.fetchone()
 
             if not row:
@@ -193,112 +267,170 @@ def process_task(message_id, data):
                     (task_id_int, task_type, "QUEUED", input_text, now, now, now),
                 )
                 conn.commit()
-                status, task_type, input_text = "QUEUED", task_type, input_text
+                status = "QUEUED"
             else:
-                status, task_type, input_text = row[0], row[1], row[2]
+                status, task_type, input_text = row
 
             if status in ("COMPLETED", "FAILED"):
-                print(f"Skipping already finished task {task_id_str} (status={status})")
-                redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
+                logger.info(
+                    "Skipping already-finished task task_id=%s status=%s", task_id_str, status
+                )
+                _ack(message_id)
                 cur.close()
                 conn.close()
                 return
 
-            cur.execute("UPDATE tasks SET status=%s, started_at=NOW() WHERE id=%s", ("PROCESSING", task_id_int))
+            cur.execute(
+                "UPDATE tasks SET status=%s, started_at=NOW(), updated_at=NOW() WHERE id=%s",
+                ("PROCESSING", task_id_int),
+            )
             conn.commit()
             publish_event("TASK_PROCESSING", task_id_str)
 
+            t0 = time.monotonic()
+            MODEL_NAME = "gemini-2.5-flash"
             prompt = f"Task: {task_type}\n\nInput:\n{input_text}\n\nReturn only the result."
-            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            response = gemini_client.models.generate_content(model=MODEL_NAME, contents=prompt)
             result = response.text
+            elapsed = time.monotonic() - t0
 
             cur.execute(
-                "UPDATE tasks SET status=%s, output_text=%s, completed_at=NOW() WHERE id=%s",
+                "UPDATE tasks SET status=%s, output_text=%s, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
                 ("COMPLETED", result, task_id_int),
             )
             conn.commit()
             publish_event("TASK_COMPLETED", task_id_str)
-            redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-            print(f"Completed task {task_id_str}")
+            _ack(message_id)
+
+            TASKS_PROCESSED.labels(worker=CONSUMER_NAME).inc()
+            TASK_DURATION.labels(worker=CONSUMER_NAME).observe(elapsed)
+            logger.info(
+                "Task completed task_id=%s duration=%.2fs", task_id_str, elapsed
+            )
             cur.close()
             conn.close()
             return
 
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            last_error = e
+            _cleanup_db(conn, cur)
+            delay = PROCESS_RETRY_BASE_DELAY_SEC * (2 ** attempt)
+            logger.warning(
+                "DB error on attempt %d/%d for task_id=%s: %s — retry in %.1fs",
+                attempt + 1, PROCESS_MAX_RETRIES, task_id_str, e, delay,
+            )
+            if attempt < PROCESS_MAX_RETRIES - 1:
+                time.sleep(delay)
+
         except Exception as e:
             last_error = e
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                if cur:
-                    cur.close()
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            _cleanup_db(conn, cur)
+            delay = PROCESS_RETRY_BASE_DELAY_SEC * (2 ** attempt)
+            logger.warning(
+                "Error on attempt %d/%d for task_id=%s: %s — retry in %.1fs",
+                attempt + 1, PROCESS_MAX_RETRIES, task_id_str, e, delay,
+            )
             if attempt < PROCESS_MAX_RETRIES - 1:
-                delay = PROCESS_RETRY_BASE_DELAY_SEC * (2 ** attempt)
-                print(f"Task {task_id_str} attempt {attempt + 1} failed: {e}. Retry in {delay}s...")
                 time.sleep(delay)
-            else:
-                break
 
-    # Final failure: mark FAILED in DB and ACK so we don't infinite retry
+    # All retries exhausted — mark task FAILED
+    logger.error(
+        "Task failed after %d attempts task_id=%s error=%s",
+        PROCESS_MAX_RETRIES, task_id_str, last_error,
+    )
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE tasks SET status=%s, error=%s, completed_at=NOW() WHERE id=%s",
+            "UPDATE tasks SET status=%s, error=%s, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
             ("FAILED", str(last_error), task_id_int),
         )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as db_err:
-        print(f"Could not mark task {task_id_str} as FAILED in DB: {db_err}")
+        logger.error("Could not mark task %s as FAILED: %s", task_id_str, db_err)
+
     publish_event("TASK_FAILED", task_id_str, {"error": str(last_error)})
+    _ack(message_id)
+    TASKS_FAILED.labels(worker=CONSUMER_NAME).inc()
+
+
+def _cleanup_db(conn, cur) -> None:
+    """Safely roll back and close DB resources."""
     try:
-        redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
-    except (redis.ConnectionError, redis.TimeoutError):
+        if conn:
+            conn.rollback()
+    except Exception:
         pass
-    print(f"Failed task {task_id_str} after {PROCESS_MAX_RETRIES} attempts: {last_error}")
-
-ensure_consumer_group()
-print("Worker started, waiting for tasks...")
-print(f"Stream trim: every {STREAM_TRIM_MAXAGE_MINUTES} min | Processing delay: {PROCESSING_DELAY_SEC}s | Max retries: {PROCESS_MAX_RETRIES}")
-last_trim = time.monotonic()
-redis_backoff = 0.0
-
-while True:
     try:
-        if redis_backoff > 0:
-            time.sleep(redis_backoff)
-            redis_backoff = min(redis_backoff * 2, 60.0)
+        if cur:
+            cur.close()
+    except Exception:
+        pass
+    try:
+        if conn:
+            conn.close()
+    except Exception:
+        pass
 
-        if STREAM_TRIM_MAXAGE_MINUTES > 0 and (time.monotonic() - last_trim) >= 60 * STREAM_TRIM_MAXAGE_MINUTES:
-            trim_stream_if_due()
-            last_trim = time.monotonic()
 
-        messages = redis_client.xreadgroup(
-            groupname=GROUP_NAME,
-            consumername=CONSUMER_NAME,
-            streams={STREAM_NAME: ">"},
-            count=1,
-            block=5000,
-        )
-        redis_backoff = 0.0  # success
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-        if messages:
-            for stream, entries in messages:
-                for message_id, data in entries:
-                    process_task(message_id, data)
+def main():
+    """Worker entry point — start Prometheus metrics server then run consume loop."""
+    gemini_client = _build_gemini_client()
 
-        reclaimed = reclaim_stuck_tasks()
-        for message_id, data in reclaimed:
-            process_task(message_id, data)
+    # Start Prometheus HTTP server on a background thread
+    start_http_server(METRICS_PORT)
+    logger.info("Prometheus metrics server started port=%d", METRICS_PORT)
 
-    except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
-        if redis_backoff == 0:
-            redis_backoff = REDIS_CONNECT_RETRY_DELAY
-        print(f"Redis error (will retry in {redis_backoff}s): {e}")
+    ensure_consumer_group()
+    logger.info(
+        "Worker started consumer=%s stream=%s | trim_maxlen=%d | delay=%ds | retries=%d",
+        CONSUMER_NAME, STREAM_NAME, STREAM_TRIM_MAXLEN, PROCESSING_DELAY_SEC, PROCESS_MAX_RETRIES,
+    )
+
+    last_trim = time.monotonic()
+    redis_backoff = 0.0
+
+    while True:
+        try:
+            if redis_backoff > 0:
+                time.sleep(redis_backoff)
+                redis_backoff = min(redis_backoff * 2, 60.0)
+
+            # Periodic stream trim
+            if (time.monotonic() - last_trim) >= 300:  # every 5 min
+                trim_stream_if_due()
+                last_trim = time.monotonic()
+
+            messages = redis_client.xreadgroup(
+                groupname=GROUP_NAME,
+                consumername=CONSUMER_NAME,
+                streams={STREAM_NAME: ">"},
+                count=1,
+                block=5000,
+            )
+            redis_backoff = 0.0
+
+            if messages:
+                for _stream, entries in messages:
+                    for message_id, data in entries:
+                        process_task(message_id, data, gemini_client)
+
+            # Check for and reclaim stuck tasks
+            reclaimed = reclaim_stuck_tasks()
+            for message_id, data in reclaimed:
+                process_task(message_id, data, gemini_client)
+
+        except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
+            if redis_backoff == 0:
+                redis_backoff = REDIS_CONNECT_RETRY_DELAY
+            logger.error("Redis error (retry in %.1fs): %s", redis_backoff, e)
+
+
+if __name__ == "__main__":
+    main()
