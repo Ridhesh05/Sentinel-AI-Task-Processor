@@ -1,8 +1,10 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Sentinel AI Task Processor</title>
+  <meta name="description" content="Distributed AI background task processing with real-time monitoring via Redis Streams, PostgreSQL, and Gemini." />
   <style>
     body {
       font-family: Arial;
@@ -68,10 +70,10 @@
       border: 1px solid #ddd;
     }
 
-    .badge.QUEUED { background: #fff7e6; border-color: #ffd9a8; color: #8a4b00; }
+    .badge.QUEUED     { background: #fff7e6; border-color: #ffd9a8; color: #8a4b00; }
     .badge.PROCESSING { background: #e8f1ff; border-color: #b5d3ff; color: #0047a3; }
-    .badge.COMPLETED { background: #eafff0; border-color: #b7f5c8; color: #0a6b2d; }
-    .badge.FAILED { background: #ffeaea; border-color: #ffc1c1; color: #b10000; }
+    .badge.COMPLETED  { background: #eafff0; border-color: #b7f5c8; color: #0a6b2d; }
+    .badge.FAILED     { background: #ffeaea; border-color: #ffc1c1; color: #b10000; }
 
     pre {
       background: #0b1020;
@@ -113,45 +115,21 @@
       border-color: #ccc;
       transform: translateY(-1px);
     }
-    /* ✅ Responsive layout */
-@media (max-width: 1100px) {
-  .grid {
-    grid-template-columns: 1fr 1fr;
-  }
-}
 
-@media (max-width: 750px) {
-  body {
-    padding: 12px;
-  }
+    /* Responsive layout */
+    @media (max-width: 1100px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
 
-  .grid {
-    grid-template-columns: 1fr;
-  }
-
-  textarea {
-    font-size: 14px;
-  }
-
-  .row {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  button {
-    width: 100%;
-  }
-
-  .log {
-    height: 180px;
-    font-size: 12px;
-  }
-
-  pre {
-    font-size: 12px;
-  }
-}
-
+    @media (max-width: 750px) {
+      body { padding: 12px; }
+      .grid { grid-template-columns: 1fr; }
+      textarea { font-size: 14px; }
+      .row { flex-direction: column; align-items: flex-start; }
+      button { width: 100%; }
+      .log { height: 180px; font-size: 12px; }
+      pre { font-size: 12px; }
+    }
   </style>
 </head>
 
@@ -201,36 +179,36 @@
 
       <p class="muted small">
         API: <code>http://localhost:8000</code> |
-        WS: <code>ws://localhost:9000/ws</code>
+        SSE: <code>http://localhost:9000/events</code>
       </p>
     </div>
 
     <!-- TASK HISTORY -->
-    <div class="row">
-  <h3 style="margin:0;">Task History</h3>
+    <div>
+      <div class="row">
+        <h3 style="margin:0;">Task History</h3>
 
-  <div style="display:flex; gap:8px; width:100%; justify-content:flex-end;">
-    <select id="statusFilter" onchange="applyHistoryFilter()" style="max-width:180px;">
-      <option value="ALL" selected>All</option>
-      <option value="QUEUED">QUEUED</option>
-      <option value="PROCESSING">PROCESSING</option>
-      <option value="COMPLETED">COMPLETED</option>
-      <option value="FAILED">FAILED</option>
-    </select>
+        <div style="display:flex; gap:8px; width:100%; justify-content:flex-end;">
+          <select id="statusFilter" onchange="applyHistoryFilter()" style="max-width:180px;">
+            <option value="ALL" selected>All</option>
+            <option value="QUEUED">QUEUED</option>
+            <option value="PROCESSING">PROCESSING</option>
+            <option value="COMPLETED">COMPLETED</option>
+            <option value="FAILED">FAILED</option>
+          </select>
 
-    <button class="secondary" onclick="loadHistory()" style="width: fit-content; padding: 8px 12px;">
-      Refresh
-    </button>
-  </div>
-</div>
-
+          <button class="secondary" onclick="loadHistory()" style="width: fit-content; padding: 8px 12px;">
+            Refresh
+          </button>
+        </div>
+      </div>
 
       <div id="historyList" style="margin-top:10px;">
         <p class="muted">No tasks yet.</p>
       </div>
     </div>
 
-    <!-- LIVE EVENTS -->
+    <!-- LIVE EVENTS (SSE) -->
     <div class="box">
       <h3>Live Events (Real-Time)</h3>
       <div class="log" id="eventLog"></div>
@@ -245,89 +223,107 @@
 
 <script>
   const API_BASE = "http://localhost:8000";
-  const WS_URL = "ws://localhost:9000/ws";
+  const SSE_URL  = "http://localhost:9000/events";
 
   let currentTaskId = null;
-  let pollInterval = null;
-  let allTasks = [];
+  let pollInterval  = null;
+  let allTasks      = [];
+  let sse           = null;
 
-
+  // ---------------------------------------------------------------------------
+  // Logging helpers
+  // ---------------------------------------------------------------------------
   function logEvent(text) {
     const log = document.getElementById("eventLog");
     log.innerText += text + "\n";
     log.scrollTop = log.scrollHeight;
   }
 
+  // ---------------------------------------------------------------------------
+  // Server-Sent Events (SSE) setup
+  // Replaces WebSocket — EventSource natively handles reconnects.
+  // ---------------------------------------------------------------------------
+  function connectSSE() {
+    if (sse) {
+      sse.close();
+    }
+
+    sse = new EventSource(SSE_URL);
+
+    sse.onopen = () => {
+      logEvent("[SSE] Connected to monitor");
+    };
+
+    sse.onerror = () => {
+      // EventSource will automatically attempt to reconnect.
+      logEvent("[SSE] Connection lost — retrying…");
+    };
+
+    sse.onmessage = async (event) => {
+      logEvent(event.data);
+      try {
+        const payload = JSON.parse(event.data);
+        if (currentTaskId && payload.task_id === currentTaskId) {
+          await fetchResult();
+        }
+      } catch (_) { /* non-JSON keep-alive comment — ignore */ }
+    };
+  }
+
+  // Start SSE on page load
+  connectSSE();
+
+  // ---------------------------------------------------------------------------
+  // UI helpers
+  // ---------------------------------------------------------------------------
   function setBadge(status) {
     const badge = document.getElementById("statusBadge");
-    badge.className = "badge"; // reset
-    if (!status) {
-      badge.innerText = "-";
-      return;
-    }
+    badge.className = "badge";
+    if (!status) { badge.innerText = "-"; return; }
     badge.innerText = status;
     badge.classList.add(status);
   }
 
   function setTimelineDefaults() {
-    document.getElementById("queuedAt").innerText = "-";
-    document.getElementById("startedAt").innerText = "-";
+    document.getElementById("queuedAt").innerText    = "-";
+    document.getElementById("startedAt").innerText   = "-";
     document.getElementById("completedAt").innerText = "-";
-    document.getElementById("duration").innerText = "Duration: -";
+    document.getElementById("duration").innerText    = "Duration: -";
   }
 
   function stopPolling() {
-    if (pollInterval) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-    }
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
   }
 
   function startPolling() {
     stopPolling();
-    pollInterval = setInterval(async () => {
-      await fetchResult();
-    }, 2000);
+    pollInterval = setInterval(async () => { await fetchResult(); }, 2000);
   }
 
-  // WebSocket for real-time monitor logs
-  const ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => logEvent("[WS] Connected to monitor");
-  ws.onclose = () => logEvent("[WS] Disconnected");
-  ws.onerror = () => logEvent("[WS] Error");
-
-  ws.onmessage = async (event) => {
-    logEvent(event.data);
-    try {
-      const payload = JSON.parse(event.data);
-      if (currentTaskId && payload.task_id === currentTaskId) {
-        await fetchResult();
-      }
-    } catch (e) {}
-  };
-
+  // ---------------------------------------------------------------------------
+  // API calls
+  // ---------------------------------------------------------------------------
   async function createTask() {
     const submitBtn = document.getElementById("submitBtn");
     const refreshBtn = document.getElementById("refreshBtn");
     const retryBtn = document.getElementById("retryBtn");
 
     submitBtn.disabled = true;
-    retryBtn.disabled = true;
+    retryBtn.disabled  = true;
 
     document.getElementById("resultBox").innerText = "-";
-    document.getElementById("taskId").innerText = "-";
+    document.getElementById("taskId").innerText    = "-";
     setBadge(null);
     setTimelineDefaults();
 
-    const taskType = document.getElementById("taskType").value;
+    const taskType  = document.getElementById("taskType").value;
     const inputText = document.getElementById("inputText").value;
 
     try {
       const res = await fetch(`${API_BASE}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task_type: taskType, input_text: inputText })
+        body: JSON.stringify({ task_type: taskType, input_text: inputText }),
       });
 
       const data = await res.json();
@@ -340,15 +336,10 @@
 
       currentTaskId = data.task_id || data.id;
       document.getElementById("taskId").innerText = currentTaskId;
-
       logEvent(`[UI] Created task ${currentTaskId}`);
-
       refreshBtn.disabled = false;
 
-      // refresh history now that a new task is created
       await loadHistory();
-
-      // fetch + poll status
       await fetchResult();
       startPolling();
 
@@ -361,25 +352,24 @@
 
   async function fetchResult() {
     const refreshBtn = document.getElementById("refreshBtn");
-    const retryBtn = document.getElementById("retryBtn");
-
+    const retryBtn   = document.getElementById("retryBtn");
     if (!currentTaskId) return;
 
     try {
-      const res = await fetch(`${API_BASE}/tasks/${currentTaskId}`);
+      const res  = await fetch(`${API_BASE}/tasks/${currentTaskId}`);
       const data = await res.json();
 
       setBadge(data.status);
       refreshBtn.disabled = false;
 
-      document.getElementById("queuedAt").innerText = data.queued_at || "-";
-      document.getElementById("startedAt").innerText = data.started_at || "-";
+      document.getElementById("queuedAt").innerText    = data.queued_at    || "-";
+      document.getElementById("startedAt").innerText   = data.started_at   || "-";
       document.getElementById("completedAt").innerText = data.completed_at || "-";
 
       if (data.started_at && data.completed_at) {
-        const start = new Date(data.started_at);
-        const end = new Date(data.completed_at);
-        const seconds = Math.round((end - start) / 1000);
+        const seconds = Math.round(
+          (new Date(data.completed_at) - new Date(data.started_at)) / 1000
+        );
         document.getElementById("duration").innerText = `Duration: ${seconds}s`;
       } else {
         document.getElementById("duration").innerText = "Duration: -";
@@ -388,14 +378,11 @@
       document.getElementById("resultBox").innerText =
         data.output_text || data.result || data.error || JSON.stringify(data, null, 2);
 
-      // Retry enabled only when FAILED
       retryBtn.disabled = (data.status !== "FAILED");
 
-      // Stop polling when finished
       if (data.status === "COMPLETED" || data.status === "FAILED") {
         stopPolling();
       }
-
     } catch (err) {
       logEvent(`[FETCH ERROR] ${err}`);
     }
@@ -406,13 +393,10 @@
     if (!currentTaskId) return;
 
     retryBtn.disabled = true;
-    logEvent(`[UI] Retrying task ${currentTaskId}...`);
+    logEvent(`[UI] Retrying task ${currentTaskId}…`);
 
     try {
-      const res = await fetch(`${API_BASE}/tasks/${currentTaskId}/retry`, {
-        method: "POST"
-      });
-
+      const res  = await fetch(`${API_BASE}/tasks/${currentTaskId}/retry`, { method: "POST" });
       const data = await res.json();
 
       if (!res.ok) {
@@ -421,37 +405,32 @@
       }
 
       logEvent(`[UI] Retry accepted: ${JSON.stringify(data)}`);
-
       await loadHistory();
       await fetchResult();
       startPolling();
-
     } catch (err) {
       logEvent(`[RETRY ERROR] ${err}`);
     }
   }
 
- async function loadHistory() {
-  const historyDiv = document.getElementById("historyList");
-  historyDiv.innerHTML = `<p class="muted">Loading...</p>`;
+  async function loadHistory() {
+    const historyDiv = document.getElementById("historyList");
+    historyDiv.innerHTML = `<p class="muted">Loading…</p>`;
 
-  try {
-    const res = await fetch(`${API_BASE}/tasks?limit=20`);
-    const data = await res.json();
+    try {
+      const res  = await fetch(`${API_BASE}/tasks?limit=20`);
+      const data = await res.json();
+      allTasks = data.tasks || [];
 
-    allTasks = data.tasks || [];
-
-    if (allTasks.length === 0) {
-      historyDiv.innerHTML = `<p class="muted">No tasks yet.</p>`;
-      return;
+      if (allTasks.length === 0) {
+        historyDiv.innerHTML = `<p class="muted">No tasks yet.</p>`;
+        return;
+      }
+      applyHistoryFilter();
+    } catch (_) {
+      historyDiv.innerHTML = `<p class="muted">Failed to load history</p>`;
     }
-
-    applyHistoryFilter();
-
-  } catch (err) {
-    historyDiv.innerHTML = `<p class="muted">Failed to load history</p>`;
   }
-}
 
   async function selectTask(taskId) {
     currentTaskId = taskId;
@@ -461,22 +440,16 @@
   }
 
   function applyHistoryFilter() {
-  const historyDiv = document.getElementById("historyList");
-  const selected = document.getElementById("statusFilter").value;
+    const historyDiv = document.getElementById("historyList");
+    const selected   = document.getElementById("statusFilter").value;
+    const filtered   = selected === "ALL" ? allTasks : allTasks.filter(t => t.status === selected);
 
-  let filtered = allTasks;
+    if (filtered.length === 0) {
+      historyDiv.innerHTML = `<p class="muted">No tasks for this filter.</p>`;
+      return;
+    }
 
-  if (selected !== "ALL") {
-    filtered = allTasks.filter(t => t.status === selected);
-  }
-
-  if (filtered.length === 0) {
-    historyDiv.innerHTML = `<p class="muted">No tasks for this filter.</p>`;
-    return;
-  }
-
-  historyDiv.innerHTML = filtered.map(t => {
-    return `
+    historyDiv.innerHTML = filtered.map(t => `
       <div class="history-card" onclick="selectTask('${t.id}')">
         <div class="row">
           <b>${t.task_type}</b>
@@ -484,16 +457,10 @@
         </div>
         <div class="muted small">${t.id}</div>
       </div>
-    `;
-  }).join("");
-}
+    `).join("");
+  }
 
-  
-  window.onload = async () => {
-    await loadHistory();
-  };
-
-
+  window.onload = async () => { await loadHistory(); };
 </script>
 
 </body>
