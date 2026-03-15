@@ -1,6 +1,14 @@
+"""Redis connection helper with retry logic and structured logging."""
+
+import logging
 import os
+import time
+
 import redis
+
 from app.exceptions import RedisUnavailableError
+
+logger = logging.getLogger(__name__)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -13,8 +21,8 @@ REDIS_RETRIES = int(os.getenv("REDIS_RETRIES", "3"))
 REDIS_RETRY_DELAY_SEC = float(os.getenv("REDIS_RETRY_DELAY_SEC", "0.3"))
 
 
-def get_redis_client():
-    """Return a Redis client. Does not ping; callers should catch redis.ConnectionError / TimeoutError."""
+def get_redis_client() -> redis.Redis:
+    """Return a Redis client. Callers must catch redis.ConnectionError / TimeoutError."""
     return redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
@@ -24,18 +32,24 @@ def get_redis_client():
     )
 
 
-def redis_ping():
-    """Ping Redis. Raises RedisUnavailableError if down."""
-    import time
+def redis_ping() -> None:
+    """Ping Redis with retries. Raises RedisUnavailableError on persistent failure."""
     last_err = None
     for attempt in range(REDIS_RETRIES):
         try:
-            r = get_redis_client()
-            r.ping()
+            get_redis_client().ping()
             return
         except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
             last_err = e
+            logger.warning(
+                "Redis ping attempt %d/%d failed: %s",
+                attempt + 1,
+                REDIS_RETRIES,
+                e,
+            )
             if attempt < REDIS_RETRIES - 1:
                 time.sleep(REDIS_RETRY_DELAY_SEC)
-            continue
-    raise RedisUnavailableError(f"Redis unreachable after {REDIS_RETRIES} attempts: {last_err}")
+
+    raise RedisUnavailableError(
+        f"Redis unreachable after {REDIS_RETRIES} attempts: {last_err}"
+    )

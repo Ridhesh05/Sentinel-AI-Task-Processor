@@ -1,7 +1,14 @@
+"""PostgreSQL connection helper with retry logic and structured logging."""
+
+import logging
 import os
 import time
+
 import psycopg2
+
 from app.exceptions import DatabaseUnavailableError
+
+logger = logging.getLogger(__name__)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
@@ -15,7 +22,7 @@ DB_CONNECT_RETRY_DELAY_SEC = float(os.getenv("DB_CONNECT_RETRY_DELAY_SEC", "0.5"
 
 
 def get_db_connection():
-    """Return a DB connection. Raises DatabaseUnavailableError if PostgreSQL is down."""
+    """Return a fresh DB connection. Raises DatabaseUnavailableError on persistent failure."""
     last_err = None
     for attempt in range(DB_CONNECT_RETRIES):
         try:
@@ -29,7 +36,15 @@ def get_db_connection():
             )
         except psycopg2.OperationalError as e:
             last_err = e
+            logger.warning(
+                "DB connect attempt %d/%d failed: %s",
+                attempt + 1,
+                DB_CONNECT_RETRIES,
+                e,
+            )
             if attempt < DB_CONNECT_RETRIES - 1:
                 time.sleep(DB_CONNECT_RETRY_DELAY_SEC)
-            continue
-    raise DatabaseUnavailableError(f"PostgreSQL unreachable after {DB_CONNECT_RETRIES} attempts: {last_err}")
+
+    raise DatabaseUnavailableError(
+        f"PostgreSQL unreachable after {DB_CONNECT_RETRIES} attempts: {last_err}"
+    )

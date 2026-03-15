@@ -1,15 +1,28 @@
+"""Redis-backed sliding-window rate limiter."""
+
+import logging
 import os
+
 import redis
-from app.redis_client import get_redis_client
+
 from app.exceptions import RedisUnavailableError
+from app.redis_client import get_redis_client
 
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "10"))   # requests
-WINDOW_SEC = int(os.getenv("RATE_WINDOW", "60"))  # seconds
+logger = logging.getLogger(__name__)
 
-def check_rate_limit(client_id: str):
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "10"))   # max requests
+WINDOW_SEC = int(os.getenv("RATE_WINDOW", "60"))  # window in seconds
+
+
+def check_rate_limit(client_id: str) -> tuple[bool, int, int]:
     """
-    Returns: (allowed: bool, remaining: int, reset_in: int).
-    Raises RedisUnavailableError if Redis is down.
+    Apply a sliding-window rate limit keyed on *client_id*.
+
+    Returns:
+        (allowed, remaining, reset_in_seconds)
+
+    Raises:
+        RedisUnavailableError: if Redis is unreachable.
     """
     try:
         r = get_redis_client()
@@ -21,6 +34,13 @@ def check_rate_limit(client_id: str):
         remaining = max(0, RATE_LIMIT - current)
         allowed = current <= RATE_LIMIT
         reset_in = ttl if ttl > 0 else WINDOW_SEC
+        if not allowed:
+            logger.info(
+                "Rate limit exceeded for client=%s current=%d limit=%d",
+                client_id,
+                current,
+                RATE_LIMIT,
+            )
         return allowed, remaining, reset_in
     except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
-        raise RedisUnavailableError(f"Redis unavailable: {e}") from e
+        raise RedisUnavailableError(f"Redis unavailable during rate-limit check: {e}") from e
