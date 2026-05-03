@@ -83,6 +83,7 @@ services:
       - PROCESSING_DELAY_SEC=0
       - PROCESS_MAX_RETRIES=3
       - METRICS_PORT=9100
+      - SPACY_CLEAN_ENABLED=1
       - LOG_LEVEL=INFO
 
   monitor:

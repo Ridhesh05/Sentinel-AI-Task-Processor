@@ -5,7 +5,8 @@ WORKDIR /app
 # Copy consolidated requirements
 COPY requirements/base.txt requirements/base.txt
 COPY requirements/worker.txt requirements/worker.txt
-RUN pip install --no-cache-dir -r requirements/worker.txt
+RUN pip install --no-cache-dir -r requirements/worker.txt \
+ && python -m spacy download en_core_web_sm
 
 COPY worker/ .
 

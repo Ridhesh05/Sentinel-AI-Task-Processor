@@ -30,6 +30,7 @@ if _worker_dir not in sys.path:
     sys.path.insert(0, _worker_dir)
 
 from snowflake import generate_snowflake_id  # noqa: E402
+from text_cleaner import clean_text  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -289,7 +290,11 @@ def process_task(message_id: str, data: dict, gemini_client) -> None:
 
             t0 = time.monotonic()
             MODEL_NAME = "gemini-2.5-flash"
-            prompt = f"Task: {task_type}\n\nInput:\n{input_text}\n\nReturn only the result."
+
+            # Clean input text (remove stopwords/fillers) before sending to Gemini.
+            # Original input_text is preserved in the database unchanged.
+            cleaned_input = clean_text(input_text)
+            prompt = f"Task: {task_type}\n\nInput:\n{cleaned_input}\n\nReturn only the result."
             response = gemini_client.models.generate_content(model=MODEL_NAME, contents=prompt)
             result = response.text
             elapsed = time.monotonic() - t0
