@@ -228,6 +228,18 @@ class RedisClient:
         """Iterate over keys matching a pattern."""
         return self.client.scan_iter(match=match, count=count)
 
+    def rpush(self, key: str, *values: str) -> int:
+        """Append values to the end of a list."""
+        return self.client.rpush(key, *values)
+
+    def lrange(self, key: str, start: int, end: int) -> list[str]:
+        """Get a range of elements from a list."""
+        return self.client.lrange(key, start, end)
+
+    def ltrim(self, key: str, start: int, stop: int) -> bool:
+        """Trim a list to the specified range."""
+        return self.client.ltrim(key, start, stop)
+
     def close(self) -> None:
         """Close the Redis connection."""
         if self._client:

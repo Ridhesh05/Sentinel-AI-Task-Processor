@@ -229,6 +229,8 @@
   let pollInterval  = null;
   let allTasks      = [];
   let sse           = null;
+  let sessionId     = sessionStorage.getItem('session_id') || crypto.randomUUID();
+  sessionStorage.setItem('session_id', sessionId);
 
   // ---------------------------------------------------------------------------
   // Logging helpers
@@ -323,7 +325,7 @@
       const res = await fetch(`${API_BASE}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task_type: taskType, input_text: inputText }),
+        body: JSON.stringify({ task_type: taskType, input_text: inputText, session_id: sessionId }),
       });
 
       const data = await res.json();

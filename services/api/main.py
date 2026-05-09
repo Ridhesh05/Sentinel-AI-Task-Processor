@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field
+from typing import Optional
 
 from core import (
     setup_logging,
@@ -60,6 +61,10 @@ class CreateTaskRequest(BaseModel):
         min_length=1,
         max_length=config.input_text_max_length,
         description="Input text for the AI task",
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description="Browser session ID for conversation memory",
     )
 
     model_config = {"json_schema_extra": {"example": {"task_type": "summarize", "input_text": "Long text to summarize..."}}}
@@ -287,7 +292,7 @@ def create_task_api(payload: CreateTaskRequest, request: Request):
         )
 
     try:
-        task_id = tasks.create_task(payload.task_type, payload.input_text)
+        task_id = tasks.create_task(payload.task_type, payload.input_text, payload.session_id)
     except RedisUnavailableError as e:
         logger.error("Task creation failed (Redis down): %s", e)
         raise HTTPException(

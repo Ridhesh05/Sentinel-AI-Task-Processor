@@ -46,7 +46,7 @@ def _parse_task_id(task_id: str) -> int | None:
         return None
 
 
-def create_task(task_type: str, input_text: str) -> int:
+def create_task(task_type: str, input_text: str, session_id: str | None = None) -> int:
     """
     Redis-first ingestion: push payload to stream and cache metadata.
 
@@ -56,6 +56,7 @@ def create_task(task_type: str, input_text: str) -> int:
     Args:
         task_type: Type of AI task (e.g., summarize, classify).
         input_text: Input text for the task.
+        session_id: Optional browser session ID for conversation memory.
 
     Returns:
         Snowflake task_id as integer.
@@ -76,6 +77,7 @@ def create_task(task_type: str, input_text: str) -> int:
                 "task_id": str(task_id),
                 "task_type": task_type,
                 "input_text": input_text,
+                "session_id": session_id or "",
                 "created_at": now,
             },
         )

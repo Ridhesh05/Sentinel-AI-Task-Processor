@@ -159,6 +159,104 @@ class Worker:
         except Exception as e:
             logger.warning("Stream trim failed: %s", e)
 
+    def _get_session_history(self, session_id: str) -> list[dict]:
+        """
+        Fetch the last 5 task outputs for a session from Redis.
+
+        Used to build conversation memory for Gemini prompts.
+        """
+        if not session_id:
+            return []
+
+        try:
+            history_key = f"session:{session_id}:history"
+            entries = self.redis.lrange(history_key, -5, -1)
+            history = []
+            for entry in entries:
+                try:
+                    history.append(json.loads(entry))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            return history
+        except Exception as e:
+            logger.warning("Failed to fetch session history session_id=%s: %s", session_id, e)
+            return []
+
+    def _save_to_session_history(
+        self,
+        session_id: str,
+        task_id: str,
+        task_type: str,
+        input_text: str,
+        output: str,
+    ) -> None:
+        """
+        Save a completed task's result to the session history in Redis.
+
+        Uses RPUSH to append and resets TTL to 30 minutes.
+        """
+        if not session_id:
+            return
+
+        try:
+            history_key = f"session:{session_id}:history"
+            entry = json.dumps({
+                "task_id": str(task_id),
+                "task_type": task_type,
+                "input_text": input_text,
+                "output": output,
+            })
+            self.redis.rpush(history_key, entry)
+            self.redis.expire(history_key, 1800)
+        except Exception as e:
+            logger.warning("Failed to save session history session_id=%s: %s", session_id, e)
+
+    def _build_memory_prompt(
+        self,
+        task_type: str,
+        input_text: str,
+        history: list[dict],
+    ) -> str:
+        """
+        Build a Gemini prompt that includes conversation memory from previous tasks.
+
+        If history exists, injects previous task outputs as context so Gemini
+        understands references like "it", "this", "the result".
+
+        Args:
+            task_type: Current task type (e.g., summarize, translate).
+            input_text: Current user input.
+            history: List of previous session task entries.
+
+        Returns:
+            Prompt string with or without memory context.
+        """
+        if not history:
+            return f"Task: {task_type}\n\nInput:\n{input_text}\n\nReturn only the result."
+
+        context_parts = []
+        for item in history:
+            output = item.get("output", "")
+            if len(output) > 500:
+                output = output[:500] + "..."
+            context_parts.append(
+                f"Previous Task ({item.get('task_type', 'unknown')}): {output}"
+            )
+
+        context = "\n".join(context_parts)
+
+        return f"""You are processing tasks in a conversation session.
+
+Previous tasks in this session:
+{context}
+
+Current Task: {task_type}
+Current Input: {input_text}
+
+Important: If the current input refers to previous output (using words like 'it', 'this', 'the result', 'that'), use the most recent previous task output as the subject.
+
+Return only the result of the current task."""
+
     def _cleanup_db(self, conn: Any, cur: Any) -> None:
         """Safely roll back and close DB resources."""
         try:
@@ -183,13 +281,16 @@ class Worker:
 
         Steps:
           1. Parse and validate task_id
-          2. Fetch or materialise task row in PostgreSQL
-          3. Idempotency check (skip if COMPLETED/FAILED)
-          4. Update status to PROCESSING + publish event
-          5. Clean input text and call Gemini
-          6. Update status to COMPLETED with output_text
-          7. Publish TASK_COMPLETED event
-          8. XACK the message
+          2. Extract session_id for conversation memory
+          3. Fetch session history from Redis
+          4. Fetch or materialise task row in PostgreSQL
+          5. Idempotency check (skip if COMPLETED/FAILED)
+          6. Update status to PROCESSING + publish event
+          7. Build prompt with memory context, call Gemini
+          8. Save to session history in Redis
+          9. Update status to COMPLETED with output_text
+          10. Publish TASK_COMPLETED event
+          11. XACK the message
 
         On exhaustion of retries, marks task as FAILED and publishes TASK_FAILED.
         The original input_text is NEVER modified in the database.
@@ -202,6 +303,7 @@ class Worker:
 
         task_type = data.get("task_type", "")
         input_text = data.get("input_text", "")
+        session_id = data.get("session_id", "")
 
         if not task_type or not input_text:
             logger.error(
@@ -263,6 +365,9 @@ class Worker:
                     self._ack(message_id)
                     return
 
+                # Fetch session history for conversation memory
+                history = self._get_session_history(session_id)
+
                 # Mark as PROCESSING
                 cur.execute(
                     "UPDATE tasks SET status=%s, started_at=NOW(), updated_at=NOW() WHERE id=%s",
@@ -271,18 +376,21 @@ class Worker:
                 conn.commit()
                 self.publish_event("TASK_PROCESSING", task_id_str)
 
-                # Call Gemini
+                # Build prompt with memory context
                 t0 = time.monotonic()
 
                 from services.worker.text_cleaner import clean_text
                 cleaned_input = clean_text(input_text)
-                prompt = f"Task: {task_type}\n\nInput:\n{cleaned_input}\n\nReturn only the result."
+                prompt = self._build_memory_prompt(task_type, cleaned_input, history)
                 response = self.gemini_client.models.generate_content(
                     model=self.config.gemini_model,
                     contents=prompt,
                 )
                 result = response.text
                 elapsed = time.monotonic() - t0
+
+                # Save to session history in Redis
+                self._save_to_session_history(session_id, task_id_str, task_type, input_text, result)
 
                 # Mark COMPLETED
                 cur.execute(
