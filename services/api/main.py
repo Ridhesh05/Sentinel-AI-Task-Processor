@@ -13,7 +13,6 @@ Responsibilities:
 
 from __future__ import annotations
 
-import logging
 import time
 from contextlib import asynccontextmanager
 
@@ -29,9 +28,6 @@ from core import (
     get_api_config,
     DatabaseUnavailableError,
     RedisUnavailableError,
-    RateLimitExceededError,
-    TaskNotFoundError,
-    TaskNotRetryableError,
 )
 from core.metrics import REQUEST_COUNT, REQUEST_LATENCY, TASK_CREATED, TASK_RETRIED
 from services.api.app import tasks, rate_limiter, deps

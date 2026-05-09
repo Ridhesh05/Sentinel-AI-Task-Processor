@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from fastapi import Request
 
-from core import RedisUnavailableError, get_api_config
-
 __all__ = ["resolve_client_id", "redis_ping", "db_health_check"]
 
 

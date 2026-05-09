@@ -8,7 +8,7 @@ instances here — import the definitions and use them in each service.
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram, Gauge
+from prometheus_client import Counter, Histogram
 
 __all__ = [
     "REQUEST_COUNT",

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Literal
+from typing import Any
 
 import redis
 from redis import asyncio as aioredis

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import NamedTuple
 
-from core import RedisUnavailableError, get_api_config
+from core import get_api_config
 
 logger = logging.getLogger(__name__)
 

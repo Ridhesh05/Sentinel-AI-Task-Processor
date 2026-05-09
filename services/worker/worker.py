@@ -14,9 +14,7 @@ Responsibilities:
 from __future__ import annotations
 
 import json
-import logging
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -28,7 +26,6 @@ from core import (
     get_logger,
     get_worker_config,
     WorkerConfig,
-    RedisUnavailableError,
 )
 from core.metrics import TASKS_PROCESSED, TASKS_FAILED, TASK_DURATION
 from core.redis import RedisClient, get_redis_client

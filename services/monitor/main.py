@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -22,10 +21,9 @@ from core import (
     setup_logging,
     get_logger,
     get_monitor_config,
-    MonitorConfig,
 )
 from core.metrics import SSE_CONNECTIONS, SSE_EVENTS_SENT
-from core.redis import AsyncRedisClient, get_async_redis_client
+from core.redis import get_async_redis_client
 
 setup_logging(level="INFO")
 logger = get_logger(__name__)
