@@ -29,7 +29,6 @@ from core import (
     get_worker_config,
     WorkerConfig,
     RedisUnavailableError,
-    DatabaseUnavailableError,
 )
 from core.metrics import TASKS_PROCESSED, TASKS_FAILED, TASK_DURATION
 from core.redis import RedisClient, get_redis_client
