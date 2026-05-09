@@ -1,2 +1,0 @@
-# Load test dependencies (standalone, no shared base needed)
-requests==2.32.3

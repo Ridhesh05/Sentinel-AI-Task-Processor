@@ -1,0 +1,139 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: sentinel_postgres
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: sentinel_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    container_name: sentinel_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=sentinel_db
+      - DB_USER=sentinel
+      - DB_PASSWORD=sentinel
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RATE_LIMIT=10
+      - RATE_WINDOW=60
+      - INPUT_TEXT_MAX_LENGTH=5000
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    container_name: sentinel_worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "9100:9100"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=sentinel_db
+      - DB_USER=sentinel
+      - DB_PASSWORD=sentinel
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_NAME=worker-1
+      - SNOWFLAKE_NODE_ID=1
+      - STREAM_TRIM_MAXLEN=10000
+      - PROCESS_MAX_RETRIES=3
+      - PROCESS_RETRY_BASE_DELAY_SEC=1.0
+      - METRICS_PORT=9100
+      - SPACY_CLEAN_ENABLED=1
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+    restart: unless-stopped
+
+  monitor:
+    build:
+      context: .
+      dockerfile: services/monitor/Dockerfile
+    container_name: sentinel_monitor
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sentinel_frontend
+    depends_on:
+      - api
+      - monitor
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+  adminer:
+    image: adminer:latest
+    container_name: sentinel_adminer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

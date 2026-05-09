@@ -1,0 +1,91 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: always
+
+  api:
+    image: ${REGISTRY:-ghcr.io/}${GITHUB_REPOSITORY:-sentinel}/sentinel-api:${IMAGE_TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=sentinel_db
+      - DB_USER=sentinel
+      - DB_PASSWORD=sentinel
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_FORMAT=json
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    image: ${REGISTRY:-ghcr.io/}${GITHUB_REPOSITORY:-sentinel}/sentinel-worker:${IMAGE_TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=sentinel_db
+      - DB_USER=sentinel
+      - DB_PASSWORD=sentinel
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_FORMAT=json
+    restart: always
+
+  monitor:
+    image: ${REGISTRY:-ghcr.io/}${GITHUB_REPOSITORY:-sentinel}/sentinel-monitor:${IMAGE_TAG:-latest}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "9000:9000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_FORMAT=json
+    restart: always
+
+volumes:
+  postgres_data:
