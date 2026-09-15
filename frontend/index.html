@@ -226,7 +226,6 @@
   const SSE_URL  = "http://localhost:9000/events";
 
   let currentTaskId = null;
-  let pollInterval  = null;
   let allTasks      = [];
   let sse           = null;
   let sessionId     = sessionStorage.getItem('session_id') || crypto.randomUUID();
@@ -242,8 +241,8 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Server-Sent Events (SSE) setup
-  // Replaces WebSocket — EventSource natively handles reconnects.
+  // Server-Sent Events (SSE) — THE ONLY source of real-time updates.
+  // No polling. SSE events carry full task data so we update the UI directly.
   // ---------------------------------------------------------------------------
   function connectSSE() {
     if (sse) {
@@ -257,7 +256,6 @@
     };
 
     sse.onerror = () => {
-      // EventSource will automatically attempt to reconnect.
       logEvent("[SSE] Connection lost — retrying…");
     };
 
@@ -265,9 +263,46 @@
       logEvent(event.data);
       try {
         const payload = JSON.parse(event.data);
-        if (currentTaskId && payload.task_id === currentTaskId) {
-          await fetchResult();
+
+        // Only care about events for the task we're watching
+        if (!currentTaskId || payload.task_id !== currentTaskId) return;
+
+        // Update UI directly from SSE event data — NO API call needed
+        if (payload.status) {
+          setBadge(payload.status);
         }
+
+        if (payload.started_at) {
+          document.getElementById("startedAt").innerText = payload.started_at;
+        }
+
+        if (payload.completed_at) {
+          document.getElementById("completedAt").innerText = payload.completed_at;
+        }
+
+        if (payload.started_at && payload.completed_at) {
+          const seconds = Math.round(
+            (new Date(payload.completed_at) - new Date(payload.started_at)) / 1000
+          );
+          document.getElementById("duration").innerText = `Duration: ${seconds}s`;
+        }
+
+        if (payload.output_text) {
+          document.getElementById("resultBox").innerText = payload.output_text;
+        }
+
+        if (payload.error) {
+          document.getElementById("resultBox").innerText = payload.error;
+        }
+
+        // On terminal state, do ONE final fetch to get the complete record
+        // and refresh history. This is the ONLY API call during task lifecycle.
+        if (payload.status === "COMPLETED" || payload.status === "FAILED") {
+          document.getElementById("retryBtn").disabled = (payload.status !== "FAILED");
+          await fetchResult();
+          await loadHistory();
+        }
+
       } catch (_) { /* non-JSON keep-alive comment — ignore */ }
     };
   }
@@ -291,15 +326,6 @@
     document.getElementById("startedAt").innerText   = "-";
     document.getElementById("completedAt").innerText = "-";
     document.getElementById("duration").innerText    = "Duration: -";
-  }
-
-  function stopPolling() {
-    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-  }
-
-  function startPolling() {
-    stopPolling();
-    pollInterval = setInterval(async () => { await fetchResult(); }, 2000);
   }
 
   // ---------------------------------------------------------------------------
@@ -338,12 +364,12 @@
 
       currentTaskId = data.task_id || data.id;
       document.getElementById("taskId").innerText = currentTaskId;
+      setBadge("QUEUED");
+      document.getElementById("queuedAt").innerText = new Date().toISOString();
       logEvent(`[UI] Created task ${currentTaskId}`);
       refreshBtn.disabled = false;
 
-      await loadHistory();
-      await fetchResult();
-      startPolling();
+      // SSE will handle all updates from here — no polling needed
 
     } catch (err) {
       logEvent(`[UI ERROR] ${err}`);
@@ -382,9 +408,6 @@
 
       retryBtn.disabled = (data.status !== "FAILED");
 
-      if (data.status === "COMPLETED" || data.status === "FAILED") {
-        stopPolling();
-      }
     } catch (err) {
       logEvent(`[FETCH ERROR] ${err}`);
     }
@@ -406,10 +429,11 @@
         return;
       }
 
+      setBadge("QUEUED");
+      document.getElementById("resultBox").innerText = "-";
       logEvent(`[UI] Retry accepted: ${JSON.stringify(data)}`);
-      await loadHistory();
-      await fetchResult();
-      startPolling();
+      // SSE will handle updates from here — no polling needed
+
     } catch (err) {
       logEvent(`[RETRY ERROR] ${err}`);
     }

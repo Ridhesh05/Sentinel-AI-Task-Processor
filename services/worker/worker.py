@@ -4,6 +4,7 @@ Sentinel AI Worker — Redis Streams consumer that processes AI tasks with Gemin
 Responsibilities:
 - Consume messages from Redis Stream via consumer group (XREADGROUP)
 - Materialise task rows in PostgreSQL
+- Keep Redis task cache in sync (write-through for API reads)
 - Call Gemini API for AI inference
 - Handle retries with exponential backoff
 - Publish events to Redis Pub/Sub
@@ -99,6 +100,49 @@ class Worker:
             )
         except Exception as e:
             logger.warning("Failed to ACK message_id=%s: %s", message_id, e)
+
+    def _update_task_cache(
+        self,
+        task_id_str: str,
+        task_type: str,
+        status: str,
+        *,
+        input_text: str = "",
+        output_text: str | None = None,
+        error: str | None = None,
+        queued_at: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> None:
+        """
+        Update the Redis task metadata cache (write-through).
+
+        The API reads Redis first for fast status lookups. This method
+        keeps the cache in sync with PostgreSQL on every status transition
+        so the API never serves stale data.
+
+        Never raises — cache update is best-effort.
+        """
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            meta = {
+                "id": task_id_str,
+                "task_type": task_type,
+                "status": status,
+                "input_text": input_text,
+                "output_text": output_text,
+                "error": error,
+                "queued_at": queued_at or now_iso,
+                "started_at": started_at,
+                "completed_at": completed_at,
+            }
+            self.redis.client.setex(
+                f"task:meta:{task_id_str}",
+                3600,
+                json.dumps(meta),
+            )
+        except Exception as e:
+            logger.warning("Failed to update task cache task_id=%s: %s", task_id_str, e)
 
     def _reclaim_stuck_tasks(self) -> list[tuple[str, dict]]:
         """
@@ -370,7 +414,17 @@ Return only the result of the current task."""
                     ("PROCESSING", task_id_int),
                 )
                 conn.commit()
-                self.publish_event("TASK_PROCESSING", task_id_str)
+                started_at_iso = datetime.now(timezone.utc).isoformat()
+                self._update_task_cache(
+                    task_id_str, task_type, "PROCESSING",
+                    input_text=input_text,
+                    started_at=started_at_iso,
+                )
+                self.publish_event("TASK_PROCESSING", task_id_str, {
+                    "status": "PROCESSING",
+                    "task_type": task_type,
+                    "started_at": started_at_iso,
+                })
 
                 # Build prompt with memory context
                 t0 = time.monotonic()
@@ -389,12 +443,25 @@ Return only the result of the current task."""
                 self._save_to_session_history(session_id, task_id_str, task_type, input_text, result)
 
                 # Mark COMPLETED
+                completed_at_iso = datetime.now(timezone.utc).isoformat()
                 cur.execute(
                     "UPDATE tasks SET status=%s, output_text=%s, completed_at=NOW(), updated_at=NOW() WHERE id=%s",
                     ("COMPLETED", result, task_id_int),
                 )
                 conn.commit()
-                self.publish_event("TASK_COMPLETED", task_id_str)
+                self._update_task_cache(
+                    task_id_str, task_type, "COMPLETED",
+                    input_text=input_text,
+                    output_text=result,
+                    completed_at=completed_at_iso,
+                )
+                self.publish_event("TASK_COMPLETED", task_id_str, {
+                    "status": "COMPLETED",
+                    "task_type": task_type,
+                    "output_text": result,
+                    "started_at": started_at_iso if 'started_at_iso' in dir() else None,
+                    "completed_at": completed_at_iso,
+                })
                 self._ack(message_id)
 
                 TASKS_PROCESSED.labels(worker=self.config.worker_name).inc()
@@ -445,6 +512,12 @@ Return only the result of the current task."""
         except Exception as db_err:
             logger.error("Could not mark task %s as FAILED: %s", task_id_str, db_err)
 
+        self._update_task_cache(
+            task_id_str, task_type, "FAILED",
+            input_text=input_text,
+            error=str(last_error),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
         self.publish_event("TASK_FAILED", task_id_str, {"error": str(last_error)})
         self._ack(message_id)
         TASKS_FAILED.labels(worker=self.config.worker_name).inc()

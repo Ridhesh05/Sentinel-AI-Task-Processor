@@ -105,7 +105,11 @@ def create_task(task_type: str, input_text: str, session_id: str | None = None) 
 
 def get_task(task_id: str) -> dict | None:
     """
-    Return task from PostgreSQL (materialised rows) or Redis cache (QUEUED state).
+    Return task from Redis cache (fast path) or PostgreSQL (fallback).
+
+    Read order: Redis first (~0.1ms) → PostgreSQL on cache miss (~5-15ms).
+    On a PostgreSQL hit, the result is backfilled into Redis so subsequent
+    reads are served from cache.
 
     Args:
         task_id: Snowflake task ID string.
@@ -115,13 +119,28 @@ def get_task(task_id: str) -> dict | None:
 
     Raises:
         DatabaseUnavailableError: if PostgreSQL is down.
-        RedisUnavailableError: if Redis is down (and cache lookup needed).
+        RedisUnavailableError: if Redis is down.
     """
     tid = _parse_task_id(task_id)
     if tid is None:
         return None
 
-    # Try PostgreSQL first (materialised rows)
+    # ── Fast path: Redis cache (~0.1ms) ──────────────────────────────────
+    try:
+        from core.redis import get_redis_client
+        r = get_redis_client()
+        raw = r.get(f"{TASK_META_PREFIX}{task_id}")
+    except RedisUnavailableError:
+        raise
+    except Exception:
+        # Redis error is non-fatal for reads — fall through to PostgreSQL
+        raw = None
+
+    if raw:
+        logger.debug("Task task_id=%s served from Redis cache", task_id)
+        return json.loads(raw)
+
+    # ── Slow path: PostgreSQL fallback (cache miss) ──────────────────────
     try:
         from core.db import get_db_client
         db = get_db_client()
@@ -136,7 +155,7 @@ def get_task(task_id: str) -> dict | None:
             fetch_one=True,
         )
         if row:
-            return {
+            task = {
                 "id": str(row[0]),
                 "task_type": row[1],
                 "status": row[2],
@@ -146,22 +165,23 @@ def get_task(task_id: str) -> dict | None:
                 "started_at": str(row[6]) if row[6] else None,
                 "completed_at": str(row[7]) if row[7] else None,
             }
+
+            # Backfill Redis cache so next read is fast
+            try:
+                r = get_redis_client()
+                r.setex(
+                    f"{TASK_META_PREFIX}{task_id}",
+                    TASK_META_TTL_SEC,
+                    json.dumps(task),
+                )
+            except Exception:
+                pass  # Cache backfill is best-effort
+
+            return task
     except DatabaseUnavailableError:
         raise
     except Exception as e:
         raise DatabaseUnavailableError(f"Database error: {e}") from e
-
-    # DB miss — fall back to Redis cache (task still queued, not yet picked up by worker)
-    try:
-        from core.redis import get_redis_client
-        r = get_redis_client()
-        raw = r.get(f"{TASK_META_PREFIX}{task_id}")
-    except RedisUnavailableError:
-        raise
-
-    if raw:
-        logger.debug("Task task_id=%s served from Redis metadata cache", task_id)
-        return json.loads(raw)
 
     return None
 
