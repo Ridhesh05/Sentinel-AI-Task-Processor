@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel"
+version = "0.1.0"
+description = "Sentinel AI Task Processor"
+readme = "readme.md"
+requires-python = ">=3.11"
+dependencies = [
+    "redis>=5.0.0",
+    "psycopg2-binary>=2.9.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = [
+    ".",
+    "core",
+    "services"
+]
+reportMissingImports = true
+reportMissingTypeStubs = false
+pythonVersion = "3.11"

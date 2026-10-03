@@ -1,16 +1,24 @@
 """
 Sentinel Monitor Service — Server-Sent Events (SSE) streaming.
 
-Subscribes to Redis Pub/Sub and fans out task events to browser clients
-via Server-Sent Events (SSE). SSE is simpler, proxy-friendly, and
-auto-reconnects on the client side via the native EventSource API.
+Each SSE client runs its own XREAD loop against the Redis events stream.
+No Pub/Sub, no shared queues, no fan-out — just one clean loop per client:
+
+    while True:
+        msgs = await redis.xread({"events": last_id}, block=15000, count=50)
+        if not msgs:
+            yield ": keepalive\\n\\n"
+            continue
+        for eid, fields in msgs:
+            yield f"id: {eid}\\ndata: {fields['data']}\\n\\n"
+
+On reconnect the browser sends Last-Event-ID automatically. The monitor
+replays everything after that ID from the stream. No missed events.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,72 +38,11 @@ logger = get_logger(__name__)
 
 config = get_monitor_config()
 
-_subscribers: set[asyncio.Queue] = set()
-_lock = asyncio.Lock()
-
-
-async def _redis_listener() -> None:
-    """
-    Background task: subscribe to Redis Pub/Sub and fan out messages to all
-    active SSE connections via their individual asyncio.Queue instances.
-
-    Implements exponential backoff on reconnection.
-    """
-    backoff = 1.0
-
-    while True:
-        try:
-            async_client = get_async_redis_client(config.redis)
-            pubsub = await async_client.subscribe(config.redis.pubsub_channel)
-            logger.info(
-                "Redis Pub/Sub listener connected channel=%s",
-                config.redis.pubsub_channel,
-            )
-            backoff = 1.0
-
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
-
-                data = message.get("data", "")
-                logger.debug("Pub/Sub event received: %s", data)
-
-                async with _lock:
-                    for q in list(_subscribers):
-                        try:
-                            q.put_nowait(data)
-                        except asyncio.QueueFull:
-                            logger.warning("SSE subscriber queue full — dropping event")
-
-        except Exception as e:
-            logger.error(
-                "Redis listener error: %s — reconnecting in %ss",
-                e,
-                backoff,
-            )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Start background Redis listener, stop it on shutdown."""
-    task = asyncio.create_task(_redis_listener())
-    logger.info("Sentinel Monitor Service started port=%d", config.port)
-    yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    logger.info("Sentinel Monitor Service stopped")
-
 
 app = FastAPI(
     title=config.app_name,
     version="1.0.0",
     description="Real-time task event streaming via Server-Sent Events (SSE)",
-    lifespan=lifespan,
     docs_url="/docs",
 )
 app.add_middleware(
@@ -144,72 +91,80 @@ def metrics():
     summary="Server-Sent Events stream",
     description=(
         "Streams real-time task events (TASK_PROCESSING, TASK_COMPLETED, TASK_FAILED) "
-        "to connected clients. The browser's native EventSource API handles "
-        "automatic reconnection on connection loss."
+        "to connected clients. On reconnect the browser sends Last-Event-ID "
+        "automatically and the server replays everything it missed."
     ),
 )
 async def sse_events(request: Request):
     """
-    Server-Sent Events stream.
+    Server-Sent Events stream backed by Redis Streams.
 
-    Each connected client receives a dedicated asyncio.Queue.
-    The background Redis listener fans events to all active queues.
+    One XREAD loop per client.  block=15000 means "wait up to 15 seconds for
+    an event."  If something arrives, send it.  If nothing arrives, send a
+    keepalive comment and loop again.
 
-    SSE wire format: data: <json-payload>\\n\\n
-    The browser EventSource API handles reconnection automatically.
+    On reconnect the browser sends Last-Event-ID.  We start XREAD from that
+    ID so every missed event is replayed immediately.
     """
-    queue: asyncio.Queue = asyncio.Queue(maxsize=config.sse_queue_maxsize)
-
-    async with _lock:
-        _subscribers.add(queue)
-
     SSE_CONNECTIONS.inc()
     client_host = request.client.host if request.client else "unknown"
+
+    # First connect → "$" (new events only)
+    # Reconnect   → browser sends Last-Event-ID automatically
+    last_id = request.headers.get("Last-Event-ID", "$")
+
     logger.info(
-        "SSE client connected client=%s total=%d",
+        "SSE client connected client=%s last_id=%s",
         client_host,
-        len(_subscribers),
+        last_id,
     )
 
+    stream_name = config.redis.event_stream_name
+    block_ms = config.sse_keepalive_sec * 1000  # 15s → 15000ms
+
     async def event_generator():
-        # Send an initial comment to confirm the stream is open
+        nonlocal last_id
+
         yield ": connected\n\n"
 
         try:
+            async_client = get_async_redis_client(config.redis)
+
             while True:
                 if await request.is_disconnected():
-                    logger.info("SSE client disconnected client=%s", client_host)
                     break
 
-                try:
-                    data = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=config.sse_keepalive_sec,
-                    )
+                msgs = await async_client.xread(
+                    {stream_name: last_id},
+                    block=block_ms,
+                    count=50,
+                )
 
-                    # Validate JSON before forwarding
-                    try:
-                        json.loads(data)
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Dropping non-JSON event: %r", data)
-                        continue
+                if not msgs:
+                    # 15s passed with no events — send a ping so proxies
+                    # don't kill the connection for being idle.
+                    yield ": keepalive\n\n"
+                    continue
 
-                    yield f"data: {data}\n\n"
-                    SSE_EVENTS_SENT.inc()
+                for _stream, entries in msgs:
+                    for eid, fields in entries:
+                        last_id = eid
+                        data = fields.get("data", "")
 
-                except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
+                        # Validate JSON before forwarding
+                        try:
+                            json.loads(data)
+                        except (json.JSONDecodeError, TypeError):
+                            logger.warning("Dropping non-JSON event: %r", data)
+                            continue
 
-        except asyncio.CancelledError:
-            logger.info("SSE generator cancelled for client=%s", client_host)
+                        yield f"id: {eid}\ndata: {data}\n\n"
+                        SSE_EVENTS_SENT.inc()
+
+        except Exception as e:
+            logger.error("SSE stream error for client=%s: %s", client_host, e)
         finally:
-            async with _lock:
-                _subscribers.discard(queue)
-            logger.info(
-                "SSE client removed client=%s remaining=%d",
-                client_host,
-                len(_subscribers),
-            )
+            logger.info("SSE client disconnected client=%s", client_host)
 
     return StreamingResponse(
         event_generator(),

@@ -166,6 +166,7 @@ class DatabaseClient:
     def transaction(self) -> Generator[psycopg2.extensions.cursor, None, None]:
         """Context manager for a database transaction (auto-commit/rollback)."""
         conn = self._get_conn()
+        cur = None
         try:
             cur = conn.cursor()
             yield cur

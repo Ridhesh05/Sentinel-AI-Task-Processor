@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Final
+from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ FILLER_WORDS: Final[set[str]] = {
     "i mean", "you see",
 }
 
-_nlp: object | None = None
+_nlp: Any = None
 _spacy_available: bool = False
 
 
@@ -43,13 +43,13 @@ def _load_spacy() -> None:
         return
 
     try:
-        import spacy
+        import spacy  # type: ignore[import-not-found]
         _nlp = spacy.load(SPACY_MODEL)
         _spacy_available = True
         logger.info("spaCy model loaded model=%s", SPACY_MODEL)
     except Exception as exc:
         _spacy_available = False
-        _nlp = False
+        _nlp = None
         logger.warning("spaCy unavailable — falling back to regex cleaner: %s", exc)
 
 

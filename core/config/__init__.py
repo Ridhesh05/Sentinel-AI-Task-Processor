@@ -71,6 +71,8 @@ class RedisSettings(BaseModel):
     stream_name: str = Field(default="ai_task_queue")
     stream_consumer_group: str = Field(default="ai_workers")
     pubsub_channel: str = Field(default="task_events")
+    event_stream_name: str = Field(default="task_events_stream")
+    event_stream_maxlen: int = Field(default=10000)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +146,7 @@ class WorkerConfig(BaseSettings):
     worker_name: str = Field(default="worker-1", validation_alias="WORKER_NAME")
     snowflake_node_id: int = Field(default=1, validation_alias="SNOWFLAKE_NODE_ID")
 
-    gemini_api_key: str = Field(validation_alias="GEMINI_API_KEY")
+    gemini_api_key: str = Field(default="", validation_alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL")
 
     stream_trim_maxlen: int = Field(default=10000, validation_alias="STREAM_TRIM_MAXLEN")

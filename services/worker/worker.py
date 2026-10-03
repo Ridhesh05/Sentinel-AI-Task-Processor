@@ -65,7 +65,11 @@ class Worker:
         task_id: str,
         extra: dict | None = None,
     ) -> None:
-        """Publish a JSON event to the Redis Pub/Sub channel. Never raises."""
+        """Append event to the Redis events stream. Never raises.
+
+        Uses XADD instead of PUBLISH so events are persisted and can be
+        replayed by the monitor after a client reconnects (podcast, not radio).
+        """
         payload = {
             "event_id": str(generate_snowflake_id()),
             "event": event_type,
@@ -77,7 +81,11 @@ class Worker:
             payload.update(extra)
 
         try:
-            self.redis.publish(self.config.redis.pubsub_channel, payload)
+            self.redis.xadd(
+                self.config.redis.event_stream_name,
+                {"data": json.dumps(payload)},
+                maxlen=self.config.redis.event_stream_maxlen,
+            )
         except Exception as e:
             logger.warning("Failed to publish event event_type=%s error=%s", event_type, e)
 
@@ -162,6 +170,8 @@ class Worker:
 
         for entry in pending:
             message_id = entry.get("message_id")
+            if not message_id:
+                continue
             idle_time = entry.get("idle_time", 0)
 
             if idle_time > self.config.stuck_message_idle_ms:
@@ -336,7 +346,7 @@ Return only the result of the current task."""
         The original input_text is NEVER modified in the database.
         """
         task_id_int, task_id_str = self._parse_task_id(data.get("task_id"))
-        if task_id_int is None:
+        if task_id_int is None or task_id_str is None:
             logger.error("Invalid stream payload — bad task_id: %r", data.get("task_id"))
             self._ack(message_id)
             return

@@ -17,6 +17,7 @@ from core import (
     RedisUnavailableError,
     DatabaseUnavailableError,
 )
+from core.redis import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,6 @@ def create_task(task_type: str, input_text: str, session_id: str | None = None) 
     now = datetime.now(timezone.utc).isoformat()
 
     try:
-        from core.redis import get_redis_client
         r = get_redis_client()
 
         r.xadd(
@@ -127,7 +127,6 @@ def get_task(task_id: str) -> dict | None:
 
     # ── Fast path: Redis cache (~0.1ms) ──────────────────────────────────
     try:
-        from core.redis import get_redis_client
         r = get_redis_client()
         raw = r.get(f"{TASK_META_PREFIX}{task_id}")
     except RedisUnavailableError:
@@ -250,14 +249,13 @@ def retry_task(task_id: str) -> dict:
     now_iso = now.isoformat()
     task_id_str = str(tid)
     try:
-        from core.redis import get_redis_client
         r = get_redis_client()
         r.xadd(
             STREAM_NAME,
             {
                 "task_id": task_id_str,
-                "task_type": task_type,
-                "input_text": input_text or "",
+                "task_type": str(task_type),
+                "input_text": str(input_text or ""),
                 "created_at": now_iso,
             },
         )

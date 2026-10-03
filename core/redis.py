@@ -11,8 +11,9 @@ import logging
 import time
 from typing import Any
 
-import redis
-from redis import asyncio as aioredis
+from redis.client import Redis
+from redis.asyncio.client import Redis as AsyncRedis, PubSub as AsyncPubSub
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError, RedisError
 
 from core.config import RedisSettings
 from core.exceptions import RedisUnavailableError
@@ -32,16 +33,16 @@ class RedisClient:
 
     def __init__(self, settings: RedisSettings) -> None:
         self._settings = settings
-        self._client: redis.Redis | None = None
+        self._client: Redis | None = None
 
     @property
     def settings(self) -> RedisSettings:
         return self._settings
 
     @property
-    def client(self) -> redis.Redis:
+    def client(self) -> Redis:
         if self._client is None:
-            self._client = redis.Redis(
+            self._client = Redis(
                 host=self._settings.host,
                 port=self._settings.port,
                 decode_responses=self._settings.decode_responses,
@@ -65,7 +66,7 @@ class RedisClient:
             try:
                 self.client.ping()
                 return
-            except (redis.ConnectionError, redis.TimeoutError, redis.RedisError) as e:
+            except (RedisConnectionError, RedisTimeoutError, RedisError) as e:
                 last_err = e
                 logger.warning(
                     "Redis ping attempt %d/%d failed: %s",
@@ -104,7 +105,7 @@ class RedisClient:
 
     def set_json(self, key: str, value: dict | list, *, ex: int | None = None) -> bool:
         """Set a JSON value in Redis with optional TTL (seconds)."""
-        return self.client.set(key, json.dumps(value), ex=ex)
+        return bool(self.client.set(key, json.dumps(value), ex=ex))
 
     def incr(self, key: str) -> int:
         """Atomically increment a key and return the new value."""
@@ -254,16 +255,16 @@ class AsyncRedisClient:
 
     def __init__(self, settings: RedisSettings) -> None:
         self._settings = settings
-        self._client: aioredis.Redis | None = None
+        self._client: AsyncRedis | None = None
 
     @property
     def settings(self) -> RedisSettings:
         return self._settings
 
     @property
-    def client(self) -> aioredis.Redis:
+    def client(self) -> AsyncRedis:
         if self._client is None:
-            self._client = aioredis.Redis(
+            self._client = AsyncRedis(
                 host=self._settings.host,
                 port=self._settings.port,
                 decode_responses=self._settings.decode_responses,
@@ -275,10 +276,30 @@ class AsyncRedisClient:
             message = json.dumps(message)
         return await self.client.publish(channel, message)
 
-    async def subscribe(self, *channels: str) -> aioredis.client.PubSub:
+    async def subscribe(self, *channels: str) -> AsyncPubSub:
         pubsub = self.client.pubsub()
         await pubsub.subscribe(*channels)
         return pubsub
+
+    async def xread(
+        self,
+        streams: dict[str, str],
+        *,
+        count: int | None = None,
+        block: int | None = None,
+    ) -> list | None:
+        """Read new entries from one or more streams.
+
+        Args:
+            streams: Dict of {stream_name: last_id} where last_id is "$" for
+                     new-only or "0" / a specific ID to replay from.
+            count: Max entries to return per stream.
+            block: Block for N milliseconds (None = non-blocking).
+
+        Returns:
+            List of (stream, entries) tuples or None.
+        """
+        return await self.client.xread(streams, count=count, block=block)
 
     async def close(self) -> None:
         if self._client:
