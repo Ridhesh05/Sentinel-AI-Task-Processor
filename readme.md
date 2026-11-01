@@ -13,6 +13,9 @@ cp .env.example .env
 docker compose -f docker-compose.dev.yml up -d
 ```
 
+<img width="683" height="180" alt="Screenshot 2026-11-01 at 6 03 01 PM" src="https://github.com/user-attachments/assets/3f9b49c5-17e0-40c3-be15-d787f4e39b73" />
+
+
 **URLs:**
 - Frontend: http://localhost:3000
 - API docs: http://localhost:8000/docs
