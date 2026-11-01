@@ -14,7 +14,7 @@ Environment variable precedence:
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
@@ -36,7 +36,7 @@ __all__ = [
 # Database
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DatabaseSettings(BaseModel):
+class DatabaseSettings(BaseSettings):
     """PostgreSQL connection settings."""
 
     host: str = Field(default="localhost", validation_alias="DB_HOST")
@@ -48,6 +48,8 @@ class DatabaseSettings(BaseModel):
     connect_retry_delay: float = Field(default=0.5, validation_alias="DB_CONNECT_RETRY_DELAY_SEC")
     connect_timeout: int = Field(default=10, validation_alias="DB_CONNECT_TIMEOUT")
 
+    model_config = {"env_prefix": "", "extra": "ignore"}
+
     @property
     def connection_string(self) -> str:
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
@@ -57,7 +59,7 @@ class DatabaseSettings(BaseModel):
 # Redis
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RedisSettings(BaseModel):
+class RedisSettings(BaseSettings):
     """Redis connection settings."""
 
     host: str = Field(default="localhost", validation_alias="REDIS_HOST")
@@ -73,6 +75,8 @@ class RedisSettings(BaseModel):
     pubsub_channel: str = Field(default="task_events")
     event_stream_name: str = Field(default="task_events_stream")
     event_stream_maxlen: int = Field(default=10000)
+
+    model_config = {"env_prefix": "", "extra": "ignore"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +114,7 @@ class APIConfig(BaseSettings):
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
 
     input_text_max_length: int = Field(default=5000, validation_alias="INPUT_TEXT_MAX_LENGTH")
-    cors_origins: list[str] = Field(
+    cors_origins: Union[str, list[str]] = Field(
         default=["http://localhost:3000", "http://127.0.0.1:3000"],
         validation_alias="CORS_ORIGINS",
     )
@@ -120,6 +124,15 @@ class APIConfig(BaseSettings):
     snowflake_node_id: int = Field(default=0, validation_alias="SNOWFLAKE_NODE_ID")
 
     model_config = {"env_prefix": "", "env_nested_delimiter": "__"}
+
+    @field_validator("rate_limit", mode="before")
+    @classmethod
+    def _coerce_rate_limit(cls, v: Any) -> Any:
+        if isinstance(v, (int, str)):
+            import os
+            window = os.getenv("RATE_WINDOW", 60)
+            return RateLimitSettings(requests_per_window=int(v), window_seconds=int(window))
+        return v
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -194,7 +207,7 @@ class MonitorConfig(BaseSettings):
     sse_queue_maxsize: int = Field(default=128, validation_alias="SSE_QUEUE_MAXSIZE")
     sse_queue_timeout: float = Field(default=30.0, validation_alias="SSE_QUEUE_TIMEOUT")
 
-    cors_origins: list[str] = Field(
+    cors_origins: Union[str, list[str]] = Field(
         default=["http://localhost:3000", "http://127.0.0.1:3000"],
         validation_alias="CORS_ORIGINS",
     )

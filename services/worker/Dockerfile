@@ -32,4 +32,6 @@ USER sentinel
 # Prometheus metrics port
 EXPOSE 9100
 
+ENV PYTHONPATH=/app
+
 CMD ["python", "-u", "services/worker/worker.py"]
